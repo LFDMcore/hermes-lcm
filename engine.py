@@ -118,6 +118,22 @@ class LCMEngine(ContextEngine):
         self._last_condensation_suppressed_reason = ""
         self._logged_filter_config = False
 
+    def __deepcopy__(self, memo):
+        """Create an isolated engine for a child agent.
+
+        The engine owns SQLite connections, which cannot be copied by Python's
+        generic deepcopy implementation.  Copy configuration data, but reopen
+        the store, DAG, and lifecycle connections in a fresh engine so child
+        agents cannot share session state or database handles with the plugin
+        singleton.
+        """
+        import copy
+
+        config = copy.deepcopy(self._config, memo)
+        clone = type(self)(config=config, hermes_home=self._hermes_home)
+        memo[id(self)] = clone
+        return clone
+
     @property
     def name(self) -> str:
         return "lcm"

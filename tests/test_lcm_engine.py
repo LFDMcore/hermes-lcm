@@ -1,5 +1,6 @@
 """Integration tests for the LCM engine."""
 
+import copy
 import json
 import logging
 import time
@@ -34,6 +35,18 @@ class TestEngineABC:
 
     def test_name(self, engine):
         assert engine.name == "lcm"
+
+    def test_deepcopy_reopens_storage_for_child_agent(self, engine):
+        clone = copy.deepcopy(engine)
+
+        assert clone is not engine
+        assert clone._store is not engine._store
+        assert clone._dag is not engine._dag
+        assert clone._lifecycle is not engine._lifecycle
+        assert clone._store._conn is not engine._store._conn
+        assert clone._dag._conn is not engine._dag._conn
+        assert clone._lifecycle._conn is not engine._lifecycle._conn
+        assert clone._store.db_path == engine._store.db_path
 
     def test_tool_schemas(self, engine):
         schemas = engine.get_tool_schemas()
