@@ -526,8 +526,7 @@ class LCMEngine(ContextEngine):
         text = content.lstrip()
         return text.startswith(
             (
-                "[ASYNC DELEGATION COMPLETE",
-                "[ASYNC DELEGATION BATCH COMPLETE",
+                "[ASYNC DELEGATION",
                 "[IMPORTANT: Background process ",
             )
         )

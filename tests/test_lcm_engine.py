@@ -349,6 +349,36 @@ class TestEngineCompress:
         assert engine._latest_real_user_index(messages) == 1
         assert engine._protected_fresh_tail_start(messages) == 1
 
+    def test_compress_does_not_summarize_human_anchor_after_async_tool_tail(self, engine, monkeypatch):
+        """Long async/tool tails must not let compaction summarize the live human task."""
+        engine._config.dynamic_leaf_chunk_enabled = False
+
+        def mock_summary(**kwargs):
+            return "Historical leaf summary.\nExpand for details about: historical turns", 1
+
+        monkeypatch.setattr(lcm_engine, "summarize_with_escalation", mock_summary)
+
+        messages = [{"role": "system", "content": "You are helpful"}]
+        for i in range(6):
+            messages.append({"role": "user", "content": f"Historical question {i}: " + "x" * 200})
+            messages.append({"role": "assistant", "content": f"Historical answer {i}: " + "y" * 200})
+
+        anchor_index = len(messages)
+        anchor_text = "Human task: fix the actual issue and do not drift"
+        messages.append({"role": "user", "content": anchor_text})
+        for i in range(8):
+            messages.append({"role": "tool", "content": f"post-anchor tool output {i}: " + "z" * 80})
+        messages.append({"role": "user", "content": "[ASYNC DELEGATION STATUS — deleg_future]\nA future async notification shape"})
+
+        result = engine.compress(messages)
+
+        stored = engine._store.get_session_messages("test-session")
+        anchor_store_id = stored[anchor_index]["store_id"]
+        nodes = engine._dag.get_session_nodes("test-session")
+        assert nodes
+        assert all(source_id < anchor_store_id for node in nodes for source_id in node.source_ids)
+        assert any(msg.get("role") == "user" and msg.get("content") == anchor_text for msg in result)
+
     def test_compress_creates_dag_node(self, engine):
         """Compression should create a DAG node."""
         messages = self._make_long_conversation(20)
