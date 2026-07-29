@@ -251,6 +251,24 @@ class TestEngineIngest:
         count = engine._store.get_session_count("test-session")
         assert count == 3
 
+    def test_ingest_normalizes_structured_content_blocks_for_sqlite(self, engine):
+        messages = [
+            {"role": "system", "content": "You are helpful"},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "Please inspect this screenshot."},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,abcdef0123456789"}},
+                ],
+            },
+        ]
+
+        engine._ingest_messages(messages)
+
+        stored = engine._store.get_session_messages("test-session")
+        assert stored[1]["content"] == "Please inspect this screenshot.\n[with media attachment]"
+        assert engine._get_store_ids_for_messages(messages) == [stored[0]["store_id"], stored[1]["store_id"]]
+
     def test_ingest_idempotent(self, engine):
         messages = [
             {"role": "system", "content": "You are helpful"},

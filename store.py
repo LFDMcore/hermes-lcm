@@ -38,6 +38,7 @@ from .search_query import (
     AGE_DECAY_RATE,
     should_apply_directness_rank_adjustment,
 )
+from .extraction import sanitize_pre_compaction_content
 from .tokens import count_message_tokens
 
 logger = logging.getLogger(__name__)
@@ -54,6 +55,11 @@ _UNKNOWN_SOURCE = "unknown"
 def _normalize_source_value(source: str | None) -> str:
     normalized = (source or "").strip()
     return normalized or _UNKNOWN_SOURCE
+
+
+def _normalize_content_value(content: Any) -> str:
+    """Normalize OpenAI message content blocks before SQLite persistence."""
+    return sanitize_pre_compaction_content(content)
 
 
 def _source_filter_clause(column: str, source: str | None) -> tuple[str | None, list[str]]:
@@ -256,7 +262,7 @@ class MessageStore:
                 session_id,
                 _normalize_source_value(source),
                 msg.get("role", "unknown"),
-                msg.get("content"),
+                _normalize_content_value(msg.get("content")),
                 msg.get("tool_call_id"),
                 tc_json,
                 msg.get("tool_name"),
@@ -291,7 +297,7 @@ class MessageStore:
                         session_id,
                         _normalize_source_value(source),
                         msg.get("role", "unknown"),
-                        msg.get("content"),
+                        _normalize_content_value(msg.get("content")),
                         msg.get("tool_call_id"),
                         tc_json,
                         msg.get("tool_name"),

@@ -898,7 +898,7 @@ class LCMEngine(ContextEngine):
         store_idx = 0
         for msg in messages:
             role = msg.get("role", "")
-            content = msg.get("content") or ""
+            content = sanitize_pre_compaction_content(msg.get("content") or "")
             probe_idx = store_idx
             while probe_idx < len(candidates):
                 stored = candidates[probe_idx]
