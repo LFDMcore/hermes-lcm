@@ -518,15 +518,33 @@ class LCMEngine(ContextEngine):
             return 0
         return count_messages_tokens(backlog)
 
+    @staticmethod
+    def _is_synthetic_user_notification(content: Any) -> bool:
+        """Return True for internal completion/check-in turns re-injected as user text."""
+        if not isinstance(content, str):
+            return False
+        text = content.lstrip()
+        return text.startswith(
+            (
+                "[ASYNC DELEGATION COMPLETE",
+                "[ASYNC DELEGATION BATCH COMPLETE",
+                "[IMPORTANT: Background process ",
+            )
+        )
+
     def _latest_real_user_index(self, messages: List[Dict[str, Any]]) -> Optional[int]:
-        """Return the newest real user turn, excluding an LCM summary blob."""
+        """Return the newest human user turn, excluding summaries and notifications."""
         for index in range(len(messages) - 1, -1, -1):
             message = messages[index]
             if message.get("role") != "user":
                 continue
             content = message.get("content")
             if isinstance(content, str):
-                if self._looks_like_active_summary_blob(content) or not content.strip():
+                if (
+                    self._looks_like_active_summary_blob(content)
+                    or self._is_synthetic_user_notification(content)
+                    or not content.strip()
+                ):
                     continue
             elif not content:
                 continue

@@ -309,6 +309,28 @@ class TestEngineCompress:
         finally:
             esc._call_llm_for_summary = original_fn
 
+    def test_protected_tail_anchors_on_human_turn_not_async_completion(self, engine):
+        """Synthetic completion turns must not displace the human task anchor."""
+        messages = [
+            {"role": "system", "content": "You are helpful"},
+            {"role": "user", "content": "Human task: fix the actual issue"},
+            *[
+                {"role": "tool", "content": f"delegation output {i}"}
+                for i in range(5)
+            ],
+            {
+                "role": "user",
+                "content": (
+                    "[ASYNC DELEGATION COMPLETE — deleg_test]\n"
+                    "Original goal: inspect the task\n"
+                    "Result: unrelated-looking but valid report"
+                ),
+            },
+        ]
+
+        assert engine._latest_real_user_index(messages) == 1
+        assert engine._protected_fresh_tail_start(messages) == 1
+
     def test_compress_creates_dag_node(self, engine):
         """Compression should create a DAG node."""
         messages = self._make_long_conversation(20)
