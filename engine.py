@@ -346,7 +346,7 @@ class LCMEngine(ContextEngine):
 
         while leaf_passes < max_leaf_passes:
             n = len(working_messages)
-            fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+            fresh_tail_start = self._protected_fresh_tail_start(working_messages)
 
             # Protect system prompt (always index 0)
             if fresh_tail_start <= 1:
@@ -507,7 +507,7 @@ class LCMEngine(ContextEngine):
 
     def _raw_backlog_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         n = len(messages)
-        fresh_tail_start = max(0, n - self._config.fresh_tail_count)
+        fresh_tail_start = self._protected_fresh_tail_start(messages)
         if fresh_tail_start <= 1:
             return []
         return messages[1:fresh_tail_start]
@@ -517,6 +517,36 @@ class LCMEngine(ContextEngine):
         if not backlog:
             return 0
         return count_messages_tokens(backlog)
+
+    def _latest_real_user_index(self, messages: List[Dict[str, Any]]) -> Optional[int]:
+        """Return the newest real user turn, excluding an LCM summary blob."""
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if isinstance(content, str):
+                if self._looks_like_active_summary_blob(content) or not content.strip():
+                    continue
+            elif not content:
+                continue
+            return index
+        return None
+
+    def _protected_fresh_tail_start(self, messages: List[Dict[str, Any]]) -> int:
+        """Keep the latest user request out of the compaction candidate set.
+
+        Long tool/delegation sequences can append more than ``fresh_tail_count``
+        messages after the user's request.  Without this boundary, compaction
+        can summarize the request itself and leave only a lossy summary in the
+        active context, causing drift from the requested task or final directive.
+        Older history remains losslessly persisted and searchable in the DAG.
+        """
+        default_start = max(0, len(messages) - self._config.fresh_tail_count)
+        latest_user = self._latest_real_user_index(messages)
+        if latest_user is None:
+            return default_start
+        return min(default_start, latest_user)
 
     def _raw_backlog_threshold(self, raw_tokens: int) -> int:
         if self._config.dynamic_leaf_chunk_enabled:
