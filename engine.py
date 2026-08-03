@@ -465,6 +465,15 @@ class LCMEngine(ContextEngine):
                     recovery_assembly_cap,
                     count_messages_tokens(compressed),
                 )
+            else:
+                # Positive signal for the ops monitor: forced-overflow recovery fired and
+                # succeeded (issue-441 guard active). Absence of the crash path + presence of
+                # this line = the overflow fix is working in production.
+                logger.info(
+                    "LCM forced-overflow recovery fired: compacted to %d tokens under cap=%d (issue-441 guard active)",
+                    count_messages_tokens(compressed),
+                    recovery_assembly_cap,
+                )
         # Reset cursor to the length of the compressed context so that
         # only messages appended *after* this point get ingested next time.
         self._ingest_cursor = len(compressed)
