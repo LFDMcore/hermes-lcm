@@ -1197,6 +1197,24 @@ class LCMEngine(ContextEngine):
                 kept_tail_reversed.append(msg)
                 tail_token_total += msg_tokens
             tail_selected = list(reversed(kept_tail_reversed))
+            anchor = self._latest_real_user_index(tail_messages)
+            kept = list(reversed(kept_tail_reversed))
+            if anchor is not None and anchor < len(tail_messages) - len(kept):
+                h = tail_messages[anchor]
+                h_tokens = count_message_tokens(h)
+                if kept:
+                    kept2: list[Dict[str, Any]] = []
+                    kept2_tokens = 0
+                    for msg in reversed(tail_messages[anchor + 1:]):
+                        mt = count_message_tokens(msg)
+                        if used + h_tokens + kept2_tokens + mt > assembly_cap:
+                            break
+                        kept2.append(msg)
+                        kept2_tokens += mt
+                    kept2 = list(reversed(kept2))
+                    if kept2:
+                        tail_selected = [h] + kept2
+                        tail_token_total = h_tokens + kept2_tokens
             summary_budget = max(0, assembly_cap - used - tail_token_total)
 
         # Collect DAG summaries — highest depth first for context hierarchy

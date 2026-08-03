@@ -1974,6 +1974,121 @@ class TestAssemblyGuardrails:
 
         assert result == messages
 
+    def test_assembly_cap_pins_latest_human_turn_when_newer_tail_fills_cap(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_pin_human.db"),
+            max_assembly_tokens=100,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+
+        # sys(10) + [H(user,20), t1(asst,30), t2(asst,30), t3(asst,30)], cap=100.
+        # H is the ONLY user turn. Newest-first walk: t3+t2+t1=90 fits (100≤100),
+        # then H(20) would push to 120>100 -> H is dropped by today's algorithm.
+        # Pin: anchor=H(idx 0), anchor < 4-3=1 -> True. Reserve H(20) first,
+        # then fill after-anchor newest-first: t3+t2 fit (10+20+60=90≤100), t1 would push to 120.
+        # Result: [H, t2, t3].
+        sys_msg = {"role": "system", "content": "s" * 10}
+        H = {"role": "user", "content": "h" * 20}
+        t1 = {"role": "assistant", "content": "a" * 30}
+        t2 = {"role": "assistant", "content": "b" * 30}
+        t3 = {"role": "assistant", "content": "c" * 30}
+
+        result = instance._assemble_context(sys_msg, [H, t1, t2, t3])
+
+        contents = [msg["content"] for msg in result[1:]]
+        assert H["content"] in contents, "Latest human turn must be pinned into result"
+        assert t3["content"] in contents, "Newest tail message must be present"
+        assert t2["content"] in contents, "Second newest must be present"
+        assert t1["content"] not in contents, "t1 must be evicted to make room for the anchor"
+
+    def test_assembly_cap_pin_yields_to_newest_when_anchor_and_newest_cannot_both_fit(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            database_path=str(tmp_path / "lcm_pin_yield.db"),
+            max_assembly_tokens=70,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+
+        # sys(10) + [H(user,50), A(asst,50)], cap=70.
+        # Walk: A(50) fits (60≤70); H(50) would make 110 -> H dropped.
+        # Pin: h=H(50), try A alongside: 10+50+0+50=110>70 -> kept2=[], pin disabled.
+        # Newest (A) wins; H must be absent. Identical to pre-pin behavior.
+        sys_msg = {"role": "system", "content": "s" * 10}
+        H = {"role": "user", "content": "h" * 50}
+        A = {"role": "assistant", "content": "a" * 50}
+
+        result = instance._assemble_context(sys_msg, [H, A])
+
+        contents = [msg["content"] for msg in result[1:]]
+        assert A["content"] in contents, "Newest message must be kept when pin cannot engage"
+        assert H["content"] not in contents, "Anchor must NOT appear when it cannot coexist with newest"
+
+    def test_forced_overflow_recovery_preserves_latest_human_turn(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            leaf_chunk_tokens=500,
+            database_path=str(tmp_path / "lcm_pin_overflow.db"),
+            max_assembly_tokens=90,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.compression_count = 1
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_messages_tokens",
+            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+        )
+
+        # sys(10) + H(user,20) + t1(asst,60) + t2(asst,30); total=120, cap=90.
+        # H is the ONLY user turn. Walk: t2(30)=40≤90 fits; t1(60): 10+30+60=100>90 stops.
+        # kept=[t2], H dropped. Pin: anchor=H(idx 0), 0 < 3-1=2 True.
+        # Reserve H(20): try t2(30): 10+20+30=60≤90 fits; t1(60): 120>90 stops.
+        # tail_selected=[H, t2]. H survives.
+        messages = [
+            {"role": "system", "content": "s" * 10},
+            {"role": "user", "content": "h" * 20},
+            {"role": "assistant", "content": "t" * 60},
+            {"role": "assistant", "content": "u" * 30},
+        ]
+
+        result = instance.compress(messages, current_tokens=120)
+
+        all_contents = [msg.get("content", "") for msg in result]
+        assert messages[1]["content"] in all_contents, "Latest human turn must survive overflow recovery"
+        assert not instance.get_status()["overflow_recovery_failed"]
+
 
 class TestEngineTools:
     def test_handle_grep(self, engine):
