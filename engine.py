@@ -168,9 +168,30 @@ class LCMEngine(ContextEngine):
         rough = count_messages_tokens(messages)
         if self._should_force_overflow_recovery(observed_tokens=rough):
             return True
+        self._refresh_raw_backlog_debt(messages)
         if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
+            return self._has_compressible_raw_backlog(messages) or self._should_run_deferred_maintenance(messages)
+        return self._should_run_deferred_maintenance(messages)
+
+    def should_compress_request_pressure(self, messages, prompt_tokens: int) -> bool:
+        """Message-aware mid-turn pressure check for protected fresh tails.
+
+        A host-level request estimate can exceed the normal threshold because
+        the recent/protected tail is huge.  If LCM has no raw backlog outside
+        that tail, a normal leaf pass cannot shrink anything; only forced
+        assembly-cap recovery can help.  Return False in that no-op case so the
+        host does not burn proactive compression cycles.
+        """
+        if self._session_ignored or self._session_stateless:
+            return False
+        if self._should_force_overflow_recovery(
+            observed_tokens=prompt_tokens,
+            messages=messages,
+        ):
             return True
         self._refresh_raw_backlog_debt(messages)
+        if self.threshold_tokens > 0 and prompt_tokens >= self.threshold_tokens:
+            return self._has_compressible_raw_backlog(messages) or self._should_run_deferred_maintenance(messages)
         return self._should_run_deferred_maintenance(messages)
 
     def _working_leaf_chunk_tokens(self, raw_tokens_outside_tail: int) -> int:
@@ -309,6 +330,7 @@ class LCMEngine(ContextEngine):
             )
             return messages
 
+        self._last_overflow_recovery_failed = False
         observed_prompt_tokens = current_tokens if current_tokens is not None else None
         force_overflow = self._should_force_overflow_recovery(
             observed_tokens=observed_prompt_tokens,
@@ -578,6 +600,12 @@ class LCMEngine(ContextEngine):
         if self._config.dynamic_leaf_chunk_enabled:
             return self._working_leaf_chunk_tokens(raw_tokens)
         return max(1, self._config.leaf_chunk_tokens)
+
+    def _has_compressible_raw_backlog(self, messages: List[Dict[str, Any]]) -> bool:
+        raw_tokens = self._raw_backlog_tokens(messages)
+        if raw_tokens <= 0:
+            return False
+        return raw_tokens >= self._raw_backlog_threshold(raw_tokens)
 
     def _has_raw_backlog_debt(self) -> bool:
         if not self._config.deferred_maintenance_enabled or not self._conversation_id:
@@ -1344,20 +1372,25 @@ class LCMEngine(ContextEngine):
         Two knobs can constrain the assembled active context:
         - max_assembly_tokens: explicit hard cap
         - reserve_tokens_floor: keep headroom inside context_length
+          (-1 means automatic 10% reserve capped at 24K; 0 disables reserve)
         """
         caps: list[int] = []
 
         if self._config.max_assembly_tokens > 0:
             caps.append(self._config.max_assembly_tokens)
 
-        if self.context_length > 0 and self._config.reserve_tokens_floor > 0:
-            reserve_cap = self.context_length - self._config.reserve_tokens_floor
+        reserve_floor = self._config.reserve_tokens_floor
+        if self.context_length > 0 and reserve_floor < 0:
+            reserve_floor = self._automatic_reserve_tokens_floor(self.context_length)
+
+        if self.context_length > 0 and reserve_floor > 0:
+            reserve_cap = self.context_length - reserve_floor
             if reserve_cap > 0:
                 caps.append(reserve_cap)
             else:
                 logger.warning(
                     "LCM reserve_tokens_floor=%d disables reserve-based assembly cap because context_length=%d",
-                    self._config.reserve_tokens_floor,
+                    reserve_floor,
                     self.context_length,
                 )
 
@@ -1365,6 +1398,13 @@ class LCMEngine(ContextEngine):
             return None
 
         return max(1, min(caps))
+
+    @staticmethod
+    def _automatic_reserve_tokens_floor(context_length: int) -> int:
+        """Default provider headroom reserve when no env/config override exists."""
+        if context_length < 65_536:
+            return 0
+        return max(1, min(24_000, int(context_length * 0.10)))
 
     # -- Internal: helpers -------------------------------------------------
 

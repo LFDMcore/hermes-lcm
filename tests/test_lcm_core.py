@@ -45,6 +45,8 @@ class TestConfig:
         assert c.large_output_transcript_gc_enabled is False
         assert c.deferred_maintenance_enabled is False
         assert c.deferred_maintenance_max_passes == 4
+        assert c.max_assembly_tokens == 0
+        assert c.reserve_tokens_floor == -1
         assert c.ignore_session_patterns == []
         assert c.stateless_session_patterns == []
         assert c.ignore_session_patterns_source == "default"
@@ -110,7 +112,7 @@ class TestConfig:
         assert c.leaf_chunk_tokens == 20_000
         assert c.context_threshold == 0.75
         assert c.max_assembly_tokens == 0
-        assert c.reserve_tokens_floor == 0
+        assert c.reserve_tokens_floor == -1
 
 
 class TestSessionPatterns:

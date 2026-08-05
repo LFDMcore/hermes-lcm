@@ -1499,6 +1499,94 @@ class TestConfigCleanup:
 
 
 class TestAssemblyGuardrails:
+    def test_default_auto_reserve_caps_assembly_without_env(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_guardrail_auto_reserve.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance.context_length = 272_000
+
+        assert instance._effective_assembly_token_cap() == 248_000
+
+    def test_explicit_zero_reserve_disables_default_auto_reserve(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_guardrail_zero_reserve.db"),
+            reserve_tokens_floor=0,
+        )
+        instance = LCMEngine(config=config)
+        instance.context_length = 272_000
+
+        assert instance._effective_assembly_token_cap() is None
+
+    def test_request_pressure_declines_when_only_protected_tail_is_large(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            leaf_chunk_tokens=100,
+            database_path=str(tmp_path / "lcm_guardrail_protected_tail.db"),
+            reserve_tokens_floor=0,
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.context_length = 200
+        instance.threshold_tokens = 80
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_messages_tokens",
+            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+        )
+
+        messages = [
+            {"role": "system", "content": "s" * 10},
+            {"role": "user", "content": "live user request"},
+            {"role": "tool", "content": "x" * 120},
+        ]
+
+        assert instance.should_compress(150) is True
+        assert instance.should_compress_request_pressure(messages, 150) is False
+
+    def test_request_pressure_runs_when_auto_reserve_needs_tail_capping(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            leaf_chunk_tokens=100,
+            database_path=str(tmp_path / "lcm_guardrail_auto_pressure.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.context_length = 272_000
+        instance.threshold_tokens = 204_000
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_messages_tokens",
+            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+        )
+
+        messages = [
+            {"role": "system", "content": "s" * 10},
+            {"role": "user", "content": "live user request"},
+            {"role": "tool", "content": "x" * 120},
+        ]
+
+        # context_length=272K => automatic 24K reserve => assembly cap 248K.
+        assert instance.should_compress_request_pressure(messages, 249_000) is True
+
     def test_max_assembly_tokens_caps_recent_tail(self, tmp_path, monkeypatch):
         import importlib
 
