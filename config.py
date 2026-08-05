@@ -82,8 +82,9 @@ class LCMConfig:
     # Hard cap for the assembled active context (0 = disabled)
     max_assembly_tokens: int = 0
     # Reserve this many tokens from the model context window before assembly.
-    # -1 = automatic reserve (10% of context, capped at 24K), 0 = disabled,
-    # >0 = explicit floor. Effective cap becomes context_length - reserve.
+    # -1 = automatic reserve for real model windows (>=64K tokens; 10% of
+    # context, capped at 24K), 0 = disabled, >0 = explicit floor. Effective
+    # cap becomes context_length - reserve.
     reserve_tokens_floor: int = -1
 
     # -- Session filtering ---

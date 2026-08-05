@@ -1499,6 +1499,15 @@ class TestConfigCleanup:
 
 
 class TestAssemblyGuardrails:
+    def test_default_auto_reserve_ignores_tiny_test_windows(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_guardrail_tiny_auto_reserve.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance.context_length = 1_200
+
+        assert instance._effective_assembly_token_cap() is None
+
     def test_default_auto_reserve_caps_assembly_without_env(self, tmp_path):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_guardrail_auto_reserve.db"),

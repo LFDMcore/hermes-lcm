@@ -40,6 +40,10 @@ from . import tools as lcm_tools
 
 logger = logging.getLogger(__name__)
 
+AUTO_RESERVE_MIN_CONTEXT_LENGTH = 65_536
+AUTO_RESERVE_MAX_TOKENS = 24_000
+AUTO_RESERVE_CONTEXT_FRACTION = 0.10
+
 
 class LCMEngine(ContextEngine):
     """Lossless Context Management engine.
@@ -166,12 +170,7 @@ class LCMEngine(ContextEngine):
                 logger.warning("Ingest during preflight: %s", e)
         from .tokens import count_messages_tokens
         rough = count_messages_tokens(messages)
-        if self._should_force_overflow_recovery(observed_tokens=rough):
-            return True
-        self._refresh_raw_backlog_debt(messages)
-        if self.threshold_tokens > 0 and rough >= self.threshold_tokens:
-            return self._has_compressible_raw_backlog(messages) or self._should_run_deferred_maintenance(messages)
-        return self._should_run_deferred_maintenance(messages)
+        return self._should_compress_for_pressure(messages, rough)
 
     def should_compress_request_pressure(self, messages, prompt_tokens: int) -> bool:
         """Message-aware mid-turn pressure check for protected fresh tails.
@@ -182,17 +181,23 @@ class LCMEngine(ContextEngine):
         assembly-cap recovery can help.  Return False in that no-op case so the
         host does not burn proactive compression cycles.
         """
+        return self._should_compress_for_pressure(messages, prompt_tokens)
+
+    def _should_compress_for_pressure(self, messages, observed_tokens: int) -> bool:
         if self._session_ignored or self._session_stateless:
             return False
-        if self._should_force_overflow_recovery(
-            observed_tokens=prompt_tokens,
-            messages=messages,
-        ):
+        if self._should_force_overflow_recovery(observed_tokens=observed_tokens):
             return True
         self._refresh_raw_backlog_debt(messages)
-        if self.threshold_tokens > 0 and prompt_tokens >= self.threshold_tokens:
-            return self._has_compressible_raw_backlog(messages) or self._should_run_deferred_maintenance(messages)
+        if self.threshold_tokens > 0 and observed_tokens >= self.threshold_tokens:
+            return (
+                self._has_compressible_raw_backlog(messages)
+                or self._should_run_deferred_maintenance(messages)
+            )
         return self._should_run_deferred_maintenance(messages)
+
+    def overflow_recovery_failed(self) -> bool:
+        return self._last_overflow_recovery_failed is True
 
     def _working_leaf_chunk_tokens(self, raw_tokens_outside_tail: int) -> int:
         base = max(1, self._config.leaf_chunk_tokens)
@@ -616,10 +621,7 @@ class LCMEngine(ContextEngine):
     def _should_run_deferred_maintenance(self, messages: List[Dict[str, Any]]) -> bool:
         if not self._has_raw_backlog_debt():
             return False
-        raw_tokens = self._raw_backlog_tokens(messages)
-        if raw_tokens <= 0:
-            return False
-        return raw_tokens >= self._raw_backlog_threshold(raw_tokens)
+        return self._has_compressible_raw_backlog(messages)
 
     def _refresh_raw_backlog_debt(self, messages: List[Dict[str, Any]]) -> None:
         if not self._config.deferred_maintenance_enabled or not self._conversation_id:
@@ -1372,7 +1374,7 @@ class LCMEngine(ContextEngine):
         Two knobs can constrain the assembled active context:
         - max_assembly_tokens: explicit hard cap
         - reserve_tokens_floor: keep headroom inside context_length
-          (-1 means automatic 10% reserve capped at 24K; 0 disables reserve)
+          (-1 means automatic reserve for >=64K-token windows; 0 disables reserve)
         """
         caps: list[int] = []
 
@@ -1402,9 +1404,15 @@ class LCMEngine(ContextEngine):
     @staticmethod
     def _automatic_reserve_tokens_floor(context_length: int) -> int:
         """Default provider headroom reserve when no env/config override exists."""
-        if context_length < 65_536:
+        if context_length < AUTO_RESERVE_MIN_CONTEXT_LENGTH:
             return 0
-        return max(1, min(24_000, int(context_length * 0.10)))
+        return max(
+            1,
+            min(
+                AUTO_RESERVE_MAX_TOKENS,
+                int(context_length * AUTO_RESERVE_CONTEXT_FRACTION),
+            ),
+        )
 
     # -- Internal: helpers -------------------------------------------------
 
