@@ -43,6 +43,9 @@ logger = logging.getLogger(__name__)
 AUTO_RESERVE_MIN_CONTEXT_LENGTH = 65_536
 AUTO_RESERVE_MAX_TOKENS = 24_000
 AUTO_RESERVE_CONTEXT_FRACTION = 0.10
+CODEX_OAUTH_TOOL_HEAVY_RESERVE_MIN = 80_000
+CODEX_OAUTH_TOOL_HEAVY_PREFIXES = ("gpt-5.4", "gpt-5.5", "gpt-5.6")
+CODEX_OAUTH_BASE_FRAGMENT = "chatgpt.com/backend-api/codex"
 
 
 class LCMEngine(ContextEngine):
@@ -827,6 +830,10 @@ class LCMEngine(ContextEngine):
                      base_url: str = "", api_key: str = "",
                      provider: str = "",
                      api_mode: str = "") -> None:
+        self.model = model or ""
+        self.base_url = base_url or ""
+        self.api_key = api_key or ""
+        self.provider = provider or ""
         self.context_length = context_length
         self.threshold_tokens = int(context_length * self._config.context_threshold)
 
@@ -1320,6 +1327,12 @@ class LCMEngine(ContextEngine):
                     effective_cap,
                     count_messages_tokens(compressed),
                 )
+            else:
+                logger.info(
+                    "LCM forced-overflow recovery fired: compacted to %d tokens under cap=%d (issue-441 guard active)",
+                    count_messages_tokens(compressed),
+                    effective_cap,
+                )
         return compressed
 
     def _should_force_overflow_recovery(
@@ -1401,18 +1414,32 @@ class LCMEngine(ContextEngine):
 
         return max(1, min(caps))
 
-    @staticmethod
-    def _automatic_reserve_tokens_floor(context_length: int) -> int:
+    def _automatic_reserve_tokens_floor(self, context_length: int) -> int:
         """Default provider headroom reserve when no env/config override exists."""
         if context_length < AUTO_RESERVE_MIN_CONTEXT_LENGTH:
             return 0
-        return max(
+        reserve = max(
             1,
             min(
                 AUTO_RESERVE_MAX_TOKENS,
                 int(context_length * AUTO_RESERVE_CONTEXT_FRACTION),
             ),
         )
+        if self._uses_codex_oauth_tool_heavy_reserve():
+            reserve = max(
+                reserve,
+                min(CODEX_OAUTH_TOOL_HEAVY_RESERVE_MIN, context_length - 1),
+            )
+        return reserve
+
+    def _uses_codex_oauth_tool_heavy_reserve(self) -> bool:
+        """Return True for Codex OAuth model families needing extra tool-schema headroom."""
+        provider = (self.provider or "").strip().lower()
+        base_url = (self.base_url or "").strip().rstrip("/").lower()
+        model = (self.model or "").strip().lower().rsplit("/", 1)[-1]
+        if provider != "openai-codex" and CODEX_OAUTH_BASE_FRAGMENT not in base_url:
+            return False
+        return model.startswith(CODEX_OAUTH_TOOL_HEAVY_PREFIXES)
 
     # -- Internal: helpers -------------------------------------------------
 

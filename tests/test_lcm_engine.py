@@ -1596,6 +1596,49 @@ class TestAssemblyGuardrails:
         # context_length=272K => automatic 24K reserve => assembly cap 248K.
         assert instance.should_compress_request_pressure(messages, 249_000) is True
 
+    def test_codex_gpt55_auto_reserve_keeps_tool_heavy_requests_below_live_limit(self, tmp_path, monkeypatch):
+        import importlib
+
+        config = LCMConfig(
+            fresh_tail_count=10,
+            leaf_chunk_tokens=100,
+            database_path=str(tmp_path / "lcm_guardrail_codex_headroom.db"),
+        )
+        instance = LCMEngine(config=config)
+        instance._session_id = "guardrail-session"
+        instance.update_model(
+            "gpt-5.5",
+            272_000,
+            base_url="https://chatgpt.com/backend-api/codex",
+            provider="openai-codex",
+        )
+
+        lcm_engine_module = importlib.import_module("hermes_lcm.engine")
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_message_tokens",
+            lambda msg: len(msg.get("content", "")),
+        )
+        monkeypatch.setattr(
+            lcm_engine_module,
+            "count_messages_tokens",
+            lambda messages: sum(len(msg.get("content", "")) for msg in messages),
+        )
+
+        messages = [
+            {"role": "system", "content": "s" * 10},
+            {"role": "user", "content": "live user request"},
+            {"role": "tool", "content": "x" * 120},
+        ]
+
+        # Regression: the Codex catalog still reports 272K, but the live
+        # responses backend rejected Hermes requests around ~229K-246K with
+        # tool schemas.  Generic auto reserve (24K => cap 248K) waits too long;
+        # Codex gpt-5.x needs a larger default safety band so the protected tail
+        # capping path fires around the observed ~204K preflight pressure.
+        assert instance._effective_assembly_token_cap() == 192_000
+        assert instance.should_compress_request_pressure(messages, 204_526) is True
+
     def test_max_assembly_tokens_caps_recent_tail(self, tmp_path, monkeypatch):
         import importlib
 
@@ -1825,7 +1868,7 @@ class TestAssemblyGuardrails:
         assert lcm_engine_module.count_messages_tokens(result) < 90
         assert instance._dag.get_session_nodes("guardrail-session")
 
-    def test_forced_overflow_tail_capping_updates_bookkeeping_without_middle_compaction(self, tmp_path, monkeypatch):
+    def test_forced_overflow_tail_capping_updates_bookkeeping_without_middle_compaction(self, tmp_path, monkeypatch, caplog):
         import importlib
 
         config = LCMConfig(
@@ -1855,12 +1898,14 @@ class TestAssemblyGuardrails:
             {"role": "assistant", "content": "b" * 40},
         ]
 
-        result = instance.compress(messages, current_tokens=90)
+        with caplog.at_level(logging.INFO, logger="hermes_lcm.engine"):
+            result = instance.compress(messages, current_tokens=90)
 
         assert result == [messages[0], messages[-1]]
         assert instance.compression_count == 1
         assert instance._ingest_cursor == len(result)
         assert not instance.get_status()["overflow_recovery_failed"]
+        assert "LCM forced-overflow recovery fired" in caplog.text
 
     def test_forced_overflow_recovery_reserves_provider_overhead(self, tmp_path, monkeypatch):
         import importlib
