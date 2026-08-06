@@ -1320,17 +1320,18 @@ class LCMEngine(ContextEngine):
         if effective_cap is None:
             self._last_overflow_recovery_failed = False
         else:
-            self._last_overflow_recovery_failed = count_messages_tokens(compressed) > effective_cap
+            compressed_tokens = count_messages_tokens(compressed)
+            self._last_overflow_recovery_failed = compressed_tokens > effective_cap
             if self._last_overflow_recovery_failed:
                 logger.warning(
                     "LCM overflow recovery could not get under cap=%d; returning best-effort context (%d tokens)",
                     effective_cap,
-                    count_messages_tokens(compressed),
+                    compressed_tokens,
                 )
             else:
                 logger.info(
                     "LCM forced-overflow recovery fired: compacted to %d tokens under cap=%d (issue-441 guard active)",
-                    count_messages_tokens(compressed),
+                    compressed_tokens,
                     effective_cap,
                 )
         return compressed
