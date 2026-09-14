@@ -91,7 +91,7 @@ class LCMConfig:
     # Sessions to exclude from LCM storage entirely.
     ignore_session_patterns: list[str] = field(default_factory=list)
     # Sessions that may read carried-over LCM state but never write new data.
-    stateless_session_patterns: list[str] = field(default_factory=list)
+    stateless_session_patterns: list[str] = field(default_factory=lambda: ["kanban"])
     # Diagnostics: where each pattern list came from.
     ignore_session_patterns_source: str = "default"
     stateless_session_patterns_source: str = "default"

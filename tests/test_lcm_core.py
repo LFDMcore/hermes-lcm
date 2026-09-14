@@ -48,7 +48,7 @@ class TestConfig:
         assert c.max_assembly_tokens == 0
         assert c.reserve_tokens_floor == -1
         assert c.ignore_session_patterns == []
-        assert c.stateless_session_patterns == []
+        assert c.stateless_session_patterns == ["kanban"]
         assert c.ignore_session_patterns_source == "default"
         assert c.stateless_session_patterns_source == "default"
         assert c.summary_model == ""

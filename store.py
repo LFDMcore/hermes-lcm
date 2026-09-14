@@ -164,15 +164,17 @@ def _fts_primary_value(result: Dict[str, Any], sort: str | None) -> float:
 class MessageStore:
     """SQLite-backed immutable message store."""
 
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, bootstrap: bool = True):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
-        self._init_db()
+        self._init_db(bootstrap=bootstrap)
 
-    def _init_db(self):
-        self._conn = sqlite3.connect(str(self.db_path), timeout=5.0, check_same_thread=False)
-        configure_connection(self._conn)
+    def _init_db(self, *, bootstrap: bool) -> None:
+        self._conn = sqlite3.connect(str(self.db_path), timeout=30.0, check_same_thread=False)
+        configure_connection(self._conn, ensure_wal=bootstrap)
+        if not bootstrap:
+            return
         self._conn.executescript("""
             CREATE TABLE IF NOT EXISTS messages (
                 store_id INTEGER PRIMARY KEY AUTOINCREMENT,

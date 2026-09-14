@@ -38,23 +38,24 @@ class LifecycleState:
 
 
 class LifecycleStateStore:
-    def __init__(self, db_path: str | Path):
+    def __init__(self, db_path: str | Path, *, bootstrap: bool = True):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
-        self._init_db()
+        self._init_db(bootstrap=bootstrap)
 
-    def _init_db(self) -> None:
+    def _init_db(self, *, bootstrap: bool) -> None:
         self._conn = sqlite3.connect(
             str(self.db_path),
             timeout=30.0,
             check_same_thread=False,
             isolation_level=None,
         )
-        configure_connection(self._conn)
+        configure_connection(self._conn, ensure_wal=bootstrap)
         self._conn.row_factory = sqlite3.Row
-        run_versioned_migrations(self._conn)
-        self._conn.commit()
+        if bootstrap:
+            run_versioned_migrations(self._conn)
+            self._conn.commit()
 
     def close(self) -> None:
         if self._conn is not None:

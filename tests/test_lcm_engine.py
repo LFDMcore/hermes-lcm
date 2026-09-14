@@ -36,10 +36,17 @@ class TestEngineABC:
     def test_name(self, engine):
         assert engine.name == "lcm"
 
-    def test_deepcopy_reopens_storage_for_child_agent(self, engine):
+    def test_deepcopy_defers_storage_open_for_child_agent(self, engine):
         clone = copy.deepcopy(engine)
 
         assert clone is not engine
+        assert clone._store_instance is None
+        assert clone._dag_instance is None
+        assert clone._lifecycle_instance is None
+
+        # First stateful use opens separate connections rather than inheriting
+        # the plugin singleton's connection or transaction state.
+        clone.on_session_start("child-session", platform="cli", context_length=200000)
         assert clone._store is not engine._store
         assert clone._dag is not engine._dag
         assert clone._lifecycle is not engine._lifecycle
@@ -47,6 +54,21 @@ class TestEngineABC:
         assert clone._dag._conn is not engine._dag._conn
         assert clone._lifecycle._conn is not engine._lifecycle._conn
         assert clone._store.db_path == engine._store.db_path
+
+    def test_deepcopy_does_not_touch_sqlite_while_writer_holds_database_lock(self, engine):
+        import sqlite3
+
+        lock = sqlite3.connect(engine._store.db_path, timeout=0.1)
+        lock.execute("BEGIN EXCLUSIVE")
+        try:
+            clone = copy.deepcopy(engine)
+        finally:
+            lock.rollback()
+            lock.close()
+
+        assert clone._store_instance is None
+        assert clone._dag_instance is None
+        assert clone._lifecycle_instance is None
 
     def test_tool_schemas(self, engine):
         schemas = engine.get_tool_schemas()
@@ -138,6 +160,48 @@ class TestEngineABC:
 
 
 class TestSessionFiltering:
+    def test_kanban_source_marks_cli_worker_stateless_without_opening_storage(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+        instance = LCMEngine(
+            config=LCMConfig(database_path=str(tmp_path / "lcm_kanban_cli_worker.db")),
+            eager_storage_bootstrap=False,
+        )
+
+        instance.on_session_start("task-session", platform="cli", context_length=1000)
+
+        assert instance.get_status()["session_stateless"] is True
+        assert instance._store_instance is None
+        assert instance._dag_instance is None
+        assert instance._lifecycle_instance is None
+        assert json.loads(instance.handle_tool_call("lcm_status", {}))["session_stateless"] is True
+        assert instance._store_instance is None
+
+    def test_stateful_clone_bootstraps_a_fresh_database_when_parent_deferred_storage(self, tmp_path):
+        config = LCMConfig(
+            database_path=str(tmp_path / "lcm_stateful_clone_bootstrap.db"),
+            stateless_session_patterns=[],
+        )
+        parent = LCMEngine(config=config, eager_storage_bootstrap=False)
+        clone = copy.deepcopy(parent)
+
+        clone.on_session_start("stateful", platform="cli", context_length=1000)
+
+        assert clone._store.get_session_count("stateful") == 0
+        assert clone._dag.get_session_nodes("stateful") == []
+
+    def test_default_kanban_session_is_stateless_without_opening_storage(self, tmp_path):
+        instance = LCMEngine(
+            config=LCMConfig(database_path=str(tmp_path / "lcm_kanban_default.db")),
+            eager_storage_bootstrap=False,
+        )
+
+        instance.on_session_start("task-session", platform="kanban", context_length=1000)
+
+        assert instance.get_status()["session_stateless"] is True
+        assert instance._store_instance is None
+        assert instance._dag_instance is None
+        assert instance._lifecycle_instance is None
+
     def test_on_session_start_marks_ignored_session_and_reports_status(self, tmp_path, caplog):
         config = LCMConfig(
             database_path=str(tmp_path / "lcm_ignore.db"),

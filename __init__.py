@@ -32,10 +32,16 @@ def register(ctx):
         from hermes_cli.config import get_hermes_home
         hermes_home = str(get_hermes_home())
     except Exception:
-        import os
         hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
 
-    engine = LCMEngine(config=config, hermes_home=hermes_home)
+    # Kanban workers are session-filtered as read-only. Do not bootstrap the
+    # shared database before their session filter gets a chance to apply.
+    eager_storage_bootstrap = os.environ.get("HERMES_SESSION_SOURCE", "").strip() != "kanban"
+    engine = LCMEngine(
+        config=config,
+        hermes_home=hermes_home,
+        eager_storage_bootstrap=eager_storage_bootstrap,
+    )
 
     # Register as the context engine (replaces ContextCompressor)
     ctx.register_context_engine(engine)

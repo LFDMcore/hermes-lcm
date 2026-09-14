@@ -219,7 +219,7 @@ Environment variables (all optional):
 | `LCM_CACHE_FRIENDLY_CONDENSATION_ENABLED` | `false` | Opt-in suppression of low-value follow-on condensation after a leaf pass |
 | `LCM_CACHE_FRIENDLY_MIN_DEBT_GROUPS` | `2` | Debt threshold multiplier before cache-friendly gating allows a follow-on condensation pass |
 | `LCM_IGNORE_SESSION_PATTERNS` | *(empty)* | Comma-separated glob patterns for sessions to exclude from LCM storage entirely |
-| `LCM_STATELESS_SESSION_PATTERNS` | *(empty)* | Comma-separated glob patterns for sessions that stay read-only (`platform:session_id` matching supported) |
+| `LCM_STATELESS_SESSION_PATTERNS` | `kanban` | Comma-separated glob patterns for sessions that stay read-only (`platform:session_id` matching supported). An explicit value replaces the default, so include `kanban` when preserving Kanban's no-write behavior. |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_ENABLED` | `false` | Opt-in externalization of oversized tool-result content into plugin-managed storage |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_THRESHOLD_CHARS` | `12000` | Character threshold above which tool results are externalized |
 | `LCM_LARGE_OUTPUT_EXTERNALIZATION_PATH` | `~/.hermes/lcm-large-outputs` | Override storage directory for externalized payloads |
