@@ -36,9 +36,13 @@ class ExternalContentFtsSpec:
         self.trigger_sqls = tuple(trigger_sqls)
 
 
-def configure_connection(conn: sqlite3.Connection, *, ensure_wal: bool = False) -> None:
+def configure_connection(
+    conn: sqlite3.Connection, *, ensure_wal: bool = False, readonly: bool = False
+) -> None:
     conn.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
-    if ensure_wal:
+    if readonly:
+        conn.execute("PRAGMA query_only=ON")
+    elif ensure_wal:
         conn.execute("PRAGMA journal_mode=WAL")
 
 

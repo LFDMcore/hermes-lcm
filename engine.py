@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import threading
 import time
 from pathlib import Path
@@ -92,6 +93,9 @@ class LCMEngine(ContextEngine):
         self._session_platform: str = ""
         self._session_source: str = ""
         self._conversation_id: str = ""
+        self._lifecycle_bound_session_id: str = ""
+        self._lifecycle_bind_conversation_id: str | None = None
+        self._lifecycle_bind_pending = False
         self._session_match_keys: list[str] = []
         self._session_ignored = False
         self._session_stateless = False
@@ -135,7 +139,7 @@ class LCMEngine(ContextEngine):
         self._last_condensation_suppressed_reason = ""
         self._logged_filter_config = False
 
-    def _ensure_storage(self) -> None:
+    def _ensure_storage(self, *, readonly: bool = False) -> None:
         """Open isolated connections, bootstrapping schema only for an owner.
 
         Child engines are deliberately connection-free until their session has
@@ -148,9 +152,10 @@ class LCMEngine(ContextEngine):
                 return
             store = dag = lifecycle = None
             try:
-                store = MessageStore(self._db_path, bootstrap=self._bootstrap_storage)
-                dag = SummaryDAG(self._db_path, bootstrap=self._bootstrap_storage)
-                lifecycle = LifecycleStateStore(self._db_path, bootstrap=self._bootstrap_storage)
+                bootstrap = self._bootstrap_storage and not readonly
+                store = MessageStore(self._db_path, bootstrap=bootstrap, readonly=readonly)
+                dag = SummaryDAG(self._db_path, bootstrap=bootstrap, readonly=readonly)
+                lifecycle = LifecycleStateStore(self._db_path, bootstrap=bootstrap, readonly=readonly)
             except Exception:
                 for component in (store, dag, lifecycle):
                     if component is not None:
@@ -163,19 +168,19 @@ class LCMEngine(ContextEngine):
 
     @property
     def _store(self) -> MessageStore:
-        self._ensure_storage()
+        self._ensure_storage(readonly=self._session_stateless)
         assert self._store_instance is not None
         return self._store_instance
 
     @property
     def _dag(self) -> SummaryDAG:
-        self._ensure_storage()
+        self._ensure_storage(readonly=self._session_stateless)
         assert self._dag_instance is not None
         return self._dag_instance
 
     @property
     def _lifecycle(self) -> LifecycleStateStore:
-        self._ensure_storage()
+        self._ensure_storage(readonly=self._session_stateless)
         assert self._lifecycle_instance is not None
         return self._lifecycle_instance
 
@@ -214,6 +219,8 @@ class LCMEngine(ContextEngine):
     def should_compress(self, prompt_tokens: int = None) -> bool:
         if self._session_ignored or self._session_stateless:
             return False
+        if self._lifecycle_bind_pending and not self._ensure_lifecycle_bound():
+            return False
         tokens = prompt_tokens if prompt_tokens is not None else self.last_prompt_tokens
         if self._should_force_overflow_recovery(observed_tokens=tokens):
             return True
@@ -224,6 +231,8 @@ class LCMEngine(ContextEngine):
     def should_compress_preflight(self, messages):
         """Pre-flight check — also ingests messages into the store."""
         if self._session_ignored or self._session_stateless:
+            return False
+        if self._lifecycle_bind_pending and not self._ensure_lifecycle_bound():
             return False
         if self._session_id and messages:
             try:
@@ -247,6 +256,8 @@ class LCMEngine(ContextEngine):
 
     def _should_compress_for_pressure(self, messages, observed_tokens: int) -> bool:
         if self._session_ignored or self._session_stateless:
+            return False
+        if self._lifecycle_bind_pending and not self._ensure_lifecycle_bound():
             return False
         if self._should_force_overflow_recovery(observed_tokens=observed_tokens):
             return True
@@ -395,6 +406,8 @@ class LCMEngine(ContextEngine):
                 "ignored" if self._session_ignored else "stateless",
                 self._session_id or "(unknown)",
             )
+            return messages
+        if self._lifecycle_bind_pending and not self._ensure_lifecycle_bound():
             return messages
 
         self._last_overflow_recovery_failed = False
@@ -592,7 +605,36 @@ class LCMEngine(ContextEngine):
     ) -> None:
         state = self._lifecycle.bind_session(session_id, conversation_id=conversation_id)
         self._conversation_id = state.conversation_id
+        self._lifecycle_bound_session_id = session_id
         self._last_compacted_store_id = state.current_frontier_store_id
+
+    def _ensure_lifecycle_bound(self) -> bool:
+        """Bind state before persistence, retrying only transient SQLite locks.
+
+        The host deliberately treats context-engine startup as best effort. A
+        lock must therefore leave this engine pending rather than half-bound:
+        no messages are persisted until lifecycle state is durable again.
+        """
+        if self._conversation_id and self._lifecycle_bound_session_id == self._session_id:
+            self._lifecycle_bind_pending = False
+            return True
+        try:
+            self._bind_lifecycle_state(
+                self._session_id,
+                conversation_id=self._lifecycle_bind_conversation_id,
+            )
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            self._lifecycle_bind_pending = True
+            logger.warning(
+                "LCM lifecycle bind deferred for session %s: %s; persistence will retry before ingest or compaction",
+                self._session_id,
+                exc,
+            )
+            return False
+        self._lifecycle_bind_pending = False
+        return True
 
     def _persist_frontier_marker(self) -> None:
         if not self._session_id or not self._conversation_id:
@@ -704,11 +746,17 @@ class LCMEngine(ContextEngine):
         self._session_id = session_id
         self._session_platform = str(kwargs.get("platform") or "")
         self._session_source = os.environ.get("HERMES_SESSION_SOURCE", "").strip()
+        self._lifecycle_bind_conversation_id = kwargs.get("conversation_id")
+        self._lifecycle_bind_pending = False
         self._ingest_cursor = 0
         self._last_compacted_store_id = 0
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
         self._refresh_session_filters()
+        if self._session_stateless:
+            # Stateless sessions may read existing history, but must never
+            # trigger schema/FTS/WAL bootstrap on their first retrieval.
+            self._bootstrap_storage = False
         if "hermes_home" in kwargs:
             self._hermes_home = kwargs["hermes_home"]
         # Pick up context_length from kwargs if provided
@@ -718,14 +766,13 @@ class LCMEngine(ContextEngine):
                 self.context_length * self._config.context_threshold
             )
         if not (self._session_ignored or self._session_stateless):
-            self._bind_lifecycle_state(
-                session_id,
-                conversation_id=kwargs.get("conversation_id"),
-            )
+            self._ensure_lifecycle_bound()
         self._log_session_filter_diagnostics()
 
     def on_session_end(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         if self._session_ignored or self._session_stateless:
+            return
+        if not self._ensure_lifecycle_bound():
             return
         # Ensure all messages are persisted
         self._ingest_messages(messages)
@@ -734,10 +781,13 @@ class LCMEngine(ContextEngine):
             session_id,
             frontier_store_id=self._last_compacted_store_id,
         )
+        self._lifecycle_bound_session_id = ""
 
     def on_session_reset(self) -> None:
         super().on_session_reset()
         if self._session_ignored or self._session_stateless:
+            return
+        if not self._conversation_id and not self._ensure_lifecycle_bound():
             return
         self._lifecycle.record_reset(self._conversation_id)
         self._last_compacted_store_id = 0
@@ -768,6 +818,8 @@ class LCMEngine(ContextEngine):
         node's original descendant message sources.
         """
         if not old_session_id or not new_session_id or old_session_id == new_session_id:
+            return 0
+        if self._lifecycle_bind_pending:
             return 0
         if (self._session_ignored or self._session_stateless) and new_session_id == self._session_id:
             logger.debug(
@@ -819,6 +871,8 @@ class LCMEngine(ContextEngine):
 
         self.on_session_start(new_session_id, conversation_id=conversation_id, **kwargs)
 
+        if self._lifecycle_bind_pending or self._lifecycle_bound_session_id != new_session_id:
+            return 0
         if not carry_over_context:
             return 0
         if old_session_id and not can_carry_over:
@@ -826,14 +880,22 @@ class LCMEngine(ContextEngine):
         return self.carry_over_new_session_context(old_session_id, new_session_id)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
+        if os.environ.get("HERMES_SESSION_SOURCE", "").strip() == "kanban" or self._is_kanban_worker():
+            return []
         return [LCM_GREP, LCM_DESCRIBE, LCM_EXPAND, LCM_EXPAND_QUERY, LCM_STATUS, LCM_DOCTOR]
 
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
-        if self._session_ignored or self._session_stateless:
+        if self._session_ignored:
             if name == "lcm_status":
                 return json.dumps(self.get_status())
             return json.dumps({
                 "error": "LCM retrieval is unavailable for this read-only session",
+                "session_stateless": self._session_stateless,
+                "session_ignored": self._session_ignored,
+            })
+        if self._is_kanban_worker():
+            return json.dumps({
+                "error": "LCM is disabled for Kanban workers to avoid shared context-store overhead",
                 "session_stateless": self._session_stateless,
                 "session_ignored": self._session_ignored,
             })
@@ -942,6 +1004,9 @@ class LCMEngine(ContextEngine):
             )
         )
 
+    def _is_kanban_worker(self) -> bool:
+        return self._session_source == "kanban" or self._session_platform == "kanban"
+
     def _log_session_filter_diagnostics(self) -> None:
         if not self._logged_filter_config:
             if self._config.ignore_session_patterns:
@@ -991,6 +1056,9 @@ class LCMEngine(ContextEngine):
                 "ignored" if self._session_ignored else "stateless",
                 self._session_id,
             )
+            return
+
+        if not self._ensure_lifecycle_bound():
             return
 
         n = len(messages)

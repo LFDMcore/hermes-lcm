@@ -101,6 +101,18 @@ class TestEngineABC:
         assert "current session" in expand_query_schema["description"].lower()
         assert "session_search" in expand_query_schema["description"]
 
+    def test_kanban_worker_exposes_no_lcm_tool_schemas(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_SESSION_SOURCE", "kanban")
+        instance = LCMEngine(
+            config=LCMConfig(database_path=str(tmp_path / "lcm_kanban_tools.db")),
+            eager_storage_bootstrap=False,
+        )
+
+        assert instance.get_tool_schemas() == []
+        assert instance._store_instance is None
+        assert instance._dag_instance is None
+        assert instance._lifecycle_instance is None
+
     def test_should_compress(self, engine):
         assert not engine.should_compress(1000)
         assert engine.should_compress(engine.threshold_tokens)
@@ -201,6 +213,11 @@ class TestSessionFiltering:
         assert instance._store_instance is None
         assert instance._dag_instance is None
         assert instance._lifecycle_instance is None
+        assert instance.get_tool_schemas() == []
+        assert "disabled for Kanban workers" in json.loads(
+            instance.handle_tool_call("lcm_grep", {"query": "history"})
+        )["error"]
+        assert instance._store_instance is None
 
     def test_on_session_start_marks_ignored_session_and_reports_status(self, tmp_path, caplog):
         config = LCMConfig(
@@ -254,6 +271,178 @@ class TestSessionFiltering:
         assert status["stateless_session_patterns_source"] == "env"
         assert "LCM stateless_session_patterns from env: telegram:*" in caplog.text
         assert "matched stateless_session_patterns" in caplog.text
+
+    def test_stateless_session_can_retrieve_prior_history_without_ingesting(self, tmp_path):
+        database_path = str(tmp_path / "lcm_stateless_read.db")
+        writer = LCMEngine(config=LCMConfig(database_path=database_path))
+        writer._store.append(
+            "prior-session",
+            {"role": "user", "content": "retained context for read-only retrieval"},
+            token_estimate=8,
+        )
+        writer.shutdown()
+
+        reader = LCMEngine(
+            config=LCMConfig(
+                database_path=database_path,
+                stateless_session_patterns=["telegram:*"],
+            ),
+            eager_storage_bootstrap=False,
+        )
+        reader.on_session_start("prior-session", platform="telegram", context_length=1000)
+
+        assert reader._bootstrap_storage is False
+        result = json.loads(reader.handle_tool_call("lcm_grep", {"query": "retained context"}))
+
+        assert "error" not in result
+        assert result["results"]
+        assert reader._store.get_session_count("prior-session") == 1
+        assert reader._store._conn.execute("PRAGMA query_only").fetchone()[0] == 1
+
+    def test_stateless_retrieval_does_not_create_a_missing_database(self, tmp_path):
+        database_path = tmp_path / "missing" / "lcm.db"
+        reader = LCMEngine(
+            config=LCMConfig(
+                database_path=str(database_path),
+                stateless_session_patterns=["telegram:*"],
+            ),
+            eager_storage_bootstrap=False,
+        )
+        reader.on_session_start("prior-session", platform="telegram", context_length=1000)
+
+        result = json.loads(reader.handle_tool_call("lcm_grep", {"query": "retained context"}))
+
+        assert result["results"] == []
+        assert not database_path.exists()
+
+    def test_transient_lifecycle_bind_defers_ingestion_until_a_retry_succeeds(self, tmp_path, monkeypatch):
+        import sqlite3
+
+        instance = LCMEngine(
+            config=LCMConfig(database_path=str(tmp_path / "lcm_bind_retry.db")),
+        )
+        lifecycle = instance._lifecycle
+        original_bind = lifecycle.bind_session
+        calls = 0
+
+        def fail_once(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return original_bind(*args, **kwargs)
+
+        monkeypatch.setattr(lifecycle, "bind_session", fail_once)
+
+        instance.on_session_start("retry-session", platform="cli", context_length=1000)
+        instance._ingest_messages([{"role": "user", "content": "persist only after lifecycle binds"}])
+
+        assert calls == 2
+        assert instance._conversation_id == "retry-session"
+        assert instance._store.get_session_count("retry-session") == 1
+
+    def test_pending_lifecycle_lock_does_not_finalize_an_unbound_session(self, tmp_path, monkeypatch):
+        import sqlite3
+
+        instance = LCMEngine(
+            config=LCMConfig(database_path=str(tmp_path / "lcm_pending_end.db")),
+        )
+        lifecycle = instance._lifecycle
+        monkeypatch.setattr(
+            lifecycle,
+            "bind_session",
+            lambda *args, **kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("database is locked")),
+        )
+        finalized = []
+        monkeypatch.setattr(
+            lifecycle,
+            "finalize_session",
+            lambda *args, **kwargs: finalized.append((args, kwargs)),
+        )
+
+        instance.on_session_start("pending-session", platform="cli", context_length=1000)
+        instance.on_session_end("pending-session", [{"role": "user", "content": "do not finalize blank lifecycle"}])
+
+        assert instance._conversation_id == ""
+        assert finalized == []
+
+    def test_same_engine_rebinds_after_finalization_before_ingesting_again(self, tmp_path):
+        instance = LCMEngine(
+            config=LCMConfig(database_path=str(tmp_path / "lcm_same_session_rebind.db")),
+        )
+        instance.on_session_start("same-session", platform="cli", context_length=1000)
+        instance.on_session_end("same-session", [])
+        instance.on_session_start("same-session", platform="cli", context_length=1000)
+        instance._ingest_messages([{"role": "user", "content": "must bind before repeat ingest"}])
+
+        state = instance._lifecycle.get_by_conversation("same-session")
+        assert state is not None
+        assert state.current_session_id == "same-session"
+        assert instance._store.get_session_count("same-session") == 1
+
+    def test_rollover_does_not_move_nodes_when_new_lifecycle_bind_is_pending(self, tmp_path, monkeypatch):
+        import sqlite3
+
+        instance = LCMEngine(
+            config=LCMConfig(database_path=str(tmp_path / "lcm_pending_rollover.db")),
+        )
+        instance.on_session_start("old-session", platform="cli", context_length=1000)
+        instance._dag.add_node(
+            SummaryNode(
+                session_id="old-session", depth=2, summary="retained node",
+                token_count=5, source_token_count=20, source_ids=[],
+                source_type="messages", created_at=time.time(),
+            )
+        )
+        lifecycle = instance._lifecycle
+        original_bind = lifecycle.bind_session
+
+        def lock_new(session_id, **kwargs):
+            if session_id == "new-session":
+                raise sqlite3.OperationalError("database is locked")
+            return original_bind(session_id, **kwargs)
+
+        monkeypatch.setattr(lifecycle, "bind_session", lock_new)
+
+        moved = instance.rollover_session("old-session", "new-session", previous_messages=[])
+
+        assert moved == 0
+        assert instance._lifecycle_bind_pending is True
+        assert len(instance._dag.get_session_nodes("old-session")) == 1
+        assert instance._dag.get_session_nodes("new-session") == []
+
+    def test_carry_over_skips_pending_new_lifecycle_bind(self, tmp_path, monkeypatch):
+        import sqlite3
+
+        instance = LCMEngine(
+            config=LCMConfig(database_path=str(tmp_path / "lcm_pending_carry.db")),
+        )
+        instance.on_session_start("old-session", platform="cli", context_length=1000)
+        instance._dag.add_node(
+            SummaryNode(
+                session_id="old-session", depth=2, summary="retained node",
+                token_count=5, source_token_count=20, source_ids=[],
+                source_type="messages", created_at=time.time(),
+            )
+        )
+        lifecycle = instance._lifecycle
+        original_bind = lifecycle.bind_session
+        monkeypatch.setattr(
+            lifecycle,
+            "bind_session",
+            lambda session_id, **kwargs: (
+                (_ for _ in ()).throw(sqlite3.OperationalError("database is locked"))
+                if session_id == "new-session" else original_bind(session_id, **kwargs)
+            ),
+        )
+        instance.on_session_start("new-session", platform="cli", context_length=1000)
+
+        moved = instance.carry_over_new_session_context("old-session", "new-session")
+
+        assert instance._lifecycle_bind_pending is True
+        assert moved == 0
+        assert len(instance._dag.get_session_nodes("old-session")) == 1
+        assert instance._dag.get_session_nodes("new-session") == []
 
     def test_ignored_session_does_not_write_to_store_or_compact(self, tmp_path):
         config = LCMConfig(

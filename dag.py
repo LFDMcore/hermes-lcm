@@ -127,14 +127,17 @@ class SummaryNode:
 class SummaryDAG:
     """SQLite-backed DAG of summary nodes."""
 
-    def __init__(self, db_path: str | Path, *, bootstrap: bool = True):
+    def __init__(self, db_path: str | Path, *, bootstrap: bool = True, readonly: bool = False):
         self.db_path = Path(db_path)
         self._conn: Optional[sqlite3.Connection] = None
-        self._init_db(bootstrap=bootstrap)
+        self._init_db(bootstrap=bootstrap, readonly=readonly)
 
-    def _init_db(self, *, bootstrap: bool) -> None:
-        self._conn = sqlite3.connect(str(self.db_path), timeout=30.0, check_same_thread=False)
-        configure_connection(self._conn, ensure_wal=bootstrap)
+    def _init_db(self, *, bootstrap: bool, readonly: bool) -> None:
+        database = f"{self.db_path.resolve().as_uri()}?mode=ro" if readonly else str(self.db_path)
+        self._conn = sqlite3.connect(
+            database, timeout=30.0, check_same_thread=False, uri=readonly,
+        )
+        configure_connection(self._conn, ensure_wal=bootstrap, readonly=readonly)
         if not bootstrap:
             return
         self._conn.executescript("""

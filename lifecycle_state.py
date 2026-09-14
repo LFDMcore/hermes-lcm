@@ -38,20 +38,23 @@ class LifecycleState:
 
 
 class LifecycleStateStore:
-    def __init__(self, db_path: str | Path, *, bootstrap: bool = True):
+    def __init__(self, db_path: str | Path, *, bootstrap: bool = True, readonly: bool = False):
         self.db_path = Path(db_path)
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        if not readonly:
+            self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._conn: Optional[sqlite3.Connection] = None
-        self._init_db(bootstrap=bootstrap)
+        self._init_db(bootstrap=bootstrap, readonly=readonly)
 
-    def _init_db(self, *, bootstrap: bool) -> None:
+    def _init_db(self, *, bootstrap: bool, readonly: bool) -> None:
+        database = f"{self.db_path.resolve().as_uri()}?mode=ro" if readonly else str(self.db_path)
         self._conn = sqlite3.connect(
-            str(self.db_path),
+            database,
             timeout=30.0,
             check_same_thread=False,
             isolation_level=None,
+            uri=readonly,
         )
-        configure_connection(self._conn, ensure_wal=bootstrap)
+        configure_connection(self._conn, ensure_wal=bootstrap, readonly=readonly)
         self._conn.row_factory = sqlite3.Row
         if bootstrap:
             run_versioned_migrations(self._conn)
