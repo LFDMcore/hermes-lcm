@@ -272,48 +272,81 @@ class TestSessionFiltering:
         assert "LCM stateless_session_patterns from env: telegram:*" in caplog.text
         assert "matched stateless_session_patterns" in caplog.text
 
-    def test_stateless_session_can_retrieve_prior_history_without_ingesting(self, tmp_path):
-        database_path = str(tmp_path / "lcm_stateless_read.db")
-        writer = LCMEngine(config=LCMConfig(database_path=database_path))
-        writer._store.append(
-            "prior-session",
-            {"role": "user", "content": "retained context for read-only retrieval"},
-            token_estimate=8,
-        )
-        writer.shutdown()
+    def test_stateless_session_never_opens_sqlite_including_status(self, tmp_path, monkeypatch):
+        import sqlite3
 
+        def forbid_connect(*_args, **_kwargs):
+            raise AssertionError("stateless session must not open SQLite")
+
+        monkeypatch.setattr(sqlite3, "connect", forbid_connect)
         reader = LCMEngine(
             config=LCMConfig(
-                database_path=database_path,
+                database_path=str(tmp_path / "lcm_stateless_read.db"),
                 stateless_session_patterns=["telegram:*"],
             ),
             eager_storage_bootstrap=False,
         )
         reader.on_session_start("prior-session", platform="telegram", context_length=1000)
-
-        assert reader._bootstrap_storage is False
         result = json.loads(reader.handle_tool_call("lcm_grep", {"query": "retained context"}))
+        status = json.loads(reader.handle_tool_call("lcm_status", {}))
 
-        assert "error" not in result
-        assert result["results"]
-        assert reader._store.get_session_count("prior-session") == 1
-        assert reader._store._conn.execute("PRAGMA query_only").fetchone()[0] == 1
+        assert "unavailable" in result["error"]
+        assert status["session_stateless"] is True
+        assert reader.get_tool_schemas() == []
+        assert reader._store_instance is None
+        assert reader._dag_instance is None
+        assert reader._lifecycle_instance is None
 
-    def test_stateless_retrieval_does_not_create_a_missing_database(self, tmp_path):
-        database_path = tmp_path / "missing" / "lcm.db"
-        reader = LCMEngine(
+    def test_stateless_session_can_transition_to_stateful_persistence(self, tmp_path):
+        database_path = tmp_path / "lcm_stateless_then_stateful.db"
+        instance = LCMEngine(
             config=LCMConfig(
                 database_path=str(database_path),
                 stateless_session_patterns=["telegram:*"],
             ),
             eager_storage_bootstrap=False,
         )
-        reader.on_session_start("prior-session", platform="telegram", context_length=1000)
+        instance.on_session_start("read-only", platform="telegram", context_length=1000)
+        assert instance._store_instance is None
 
-        result = json.loads(reader.handle_tool_call("lcm_grep", {"query": "retained context"}))
+        instance.on_session_start("interactive", platform="cli", context_length=1000)
+        instance._ingest_messages([{"role": "user", "content": "persist after stateless session"}])
 
-        assert result["results"] == []
-        assert not database_path.exists()
+        assert instance._store.get_session_count("interactive") == 1
+        assert instance._store._conn.execute("PRAGMA query_only").fetchone()[0] == 0
+
+    def test_repeated_session_start_reloads_durable_frontier(self, tmp_path):
+        instance = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "lcm_frontier_rebind.db")))
+        instance.on_session_start("same-session", platform="cli", conversation_id="conversation", context_length=1000)
+        instance._lifecycle.advance_frontier("conversation", "same-session", 42)
+
+        instance.on_session_start("same-session", platform="cli", conversation_id="conversation", context_length=1000)
+
+        assert instance._conversation_id == "conversation"
+        assert instance._last_compacted_store_id == 42
+
+    def test_pending_new_session_reset_cannot_mutate_previous_lifecycle(self, tmp_path, monkeypatch):
+        import sqlite3
+
+        instance = LCMEngine(config=LCMConfig(database_path=str(tmp_path / "lcm_pending_reset.db")))
+        instance.on_session_start("old-session", platform="cli", conversation_id="old-conversation", context_length=1000)
+        lifecycle = instance._lifecycle
+        original_bind = lifecycle.bind_session
+
+        def lock_new(session_id, **kwargs):
+            if session_id == "new-session":
+                raise sqlite3.OperationalError("database is locked")
+            return original_bind(session_id, **kwargs)
+
+        monkeypatch.setattr(lifecycle, "bind_session", lock_new)
+        instance.on_session_start("new-session", platform="cli", conversation_id="new-conversation", context_length=1000)
+        instance.on_session_reset()
+
+        old_state = lifecycle.get_by_conversation("old-conversation")
+        assert instance._lifecycle_bind_pending is True
+        assert instance._conversation_id == ""
+        assert old_state is not None
+        assert old_state.last_reset_at is None
 
     def test_transient_lifecycle_bind_defers_ingestion_until_a_retry_succeeds(self, tmp_path, monkeypatch):
         import sqlite3

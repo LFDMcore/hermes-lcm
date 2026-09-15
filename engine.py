@@ -747,16 +747,17 @@ class LCMEngine(ContextEngine):
         self._session_platform = str(kwargs.get("platform") or "")
         self._session_source = os.environ.get("HERMES_SESSION_SOURCE", "").strip()
         self._lifecycle_bind_conversation_id = kwargs.get("conversation_id")
+        # A session start must never inherit another session's durable binding.
+        # Clear it before binding so a same-session restart reloads its frontier,
+        # while a locked new session cannot mutate the previous conversation.
+        self._conversation_id = ""
+        self._lifecycle_bound_session_id = ""
         self._lifecycle_bind_pending = False
         self._ingest_cursor = 0
         self._last_compacted_store_id = 0
         self._last_overflow_recovery_failed = False
         self._last_condensation_suppressed_reason = ""
         self._refresh_session_filters()
-        if self._session_stateless:
-            # Stateless sessions may read existing history, but must never
-            # trigger schema/FTS/WAL bootstrap on their first retrieval.
-            self._bootstrap_storage = False
         if "hermes_home" in kwargs:
             self._hermes_home = kwargs["hermes_home"]
         # Pick up context_length from kwargs if provided
@@ -787,7 +788,7 @@ class LCMEngine(ContextEngine):
         super().on_session_reset()
         if self._session_ignored or self._session_stateless:
             return
-        if not self._conversation_id and not self._ensure_lifecycle_bound():
+        if not self._ensure_lifecycle_bound():
             return
         self._lifecycle.record_reset(self._conversation_id)
         self._last_compacted_store_id = 0
@@ -880,16 +881,19 @@ class LCMEngine(ContextEngine):
         return self.carry_over_new_session_context(old_session_id, new_session_id)
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        if os.environ.get("HERMES_SESSION_SOURCE", "").strip() == "kanban" or self._is_kanban_worker():
+        if self._session_stateless or os.environ.get("HERMES_SESSION_SOURCE", "").strip() == "kanban" or self._is_kanban_worker():
             return []
         return [LCM_GREP, LCM_DESCRIBE, LCM_EXPAND, LCM_EXPAND_QUERY, LCM_STATUS, LCM_DOCTOR]
 
     def handle_tool_call(self, name: str, args: Dict[str, Any], **kwargs) -> str:
-        if self._session_ignored:
+        if self._session_ignored or self._session_stateless:
             if name == "lcm_status":
                 return json.dumps(self.get_status())
+            error = "LCM retrieval is unavailable for this read-only session"
+            if self._is_kanban_worker():
+                error = "LCM is disabled for Kanban workers to avoid shared context-store overhead"
             return json.dumps({
-                "error": "LCM retrieval is unavailable for this read-only session",
+                "error": error,
                 "session_stateless": self._session_stateless,
                 "session_ignored": self._session_ignored,
             })
