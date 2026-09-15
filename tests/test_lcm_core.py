@@ -1295,6 +1295,35 @@ class TestSummaryDAG:
     def dag(self, tmp_path):
         return SummaryDAG(tmp_path / "test.db")
 
+    def test_noop_write_helpers_release_transaction_for_another_writer(self, tmp_path):
+        db_path = tmp_path / "noop-write-lock.db"
+        dag = SummaryDAG(db_path)
+        peer = sqlite3.connect(db_path, timeout=0.1)
+        peer.execute("PRAGMA busy_timeout=100")
+        writer = MessageStore(db_path)
+        try:
+            assert dag.reassign_session_nodes("missing-old", "missing-new") == 0
+            assert dag._conn.in_transaction is False
+            peer.execute("BEGIN IMMEDIATE")
+            peer.rollback()
+            assert writer.append("writer", {"role": "user", "content": "after reassign"}) > 0
+
+            assert dag.delete_session_nodes("missing-session") == 0
+            assert dag._conn.in_transaction is False
+            peer.execute("BEGIN IMMEDIATE")
+            peer.rollback()
+            assert writer.append("writer", {"role": "user", "content": "after delete"}) > 0
+
+            assert dag.delete_below_depth("missing-session", 1) == 0
+            assert dag._conn.in_transaction is False
+            peer.execute("BEGIN IMMEDIATE")
+            peer.rollback()
+            assert writer.append("writer", {"role": "user", "content": "after depth delete"}) > 0
+        finally:
+            writer.close()
+            peer.close()
+            dag.close()
+
     def test_add_and_get(self, dag):
         node = SummaryNode(
             session_id="s1", depth=0,
